@@ -159,23 +159,33 @@ def profile_memory_bandwidth() -> int:
     Returns measured bandwidth in bytes/second.
     Raises exception if MLX is unavailable or profiling fails.
 
-    Note: This allocates ~4 GB of GPU unified memory (2 GB for source + 2 GB for
-    destination arrays). On systems with limited memory or when models are loaded,
-    this may cause memory pressure. The caller should handle exceptions appropriately.
+    Note: The benchmark needs two equal-sized buffers (source + destination), so
+    the working set is twice the buffer size. The buffer is sized to at most a
+    quarter of currently available memory so profiling never consumes more than
+    half of it, and is skipped entirely when memory is too scarce for a
+    meaningful measurement.
 
     Design note: Bandwidth is profiled only once at startup. For Apple Silicon,
     unified memory bandwidth is a hardware constant (architecture and clock frequency
     dependent), making re-profiling unnecessary. This avoids the cost and risk of
-    repeated 4GB allocations during operation.
+    repeated multi-GB allocations during operation.
     """
     import mlx.core as mx
 
     if not mx.metal.is_available():
         raise RuntimeError("Metal is not available")
 
-    # Use 2GB buffer to better saturate memory bandwidth
-    # WARNING: This allocates ~4GB temporarily (source + destination)
-    size_bytes = 2 * 1024 * 1024 * 1024
+    # Prefer a 2GB buffer to saturate memory bandwidth, but never take more than
+    # a quarter of available memory (the copy needs 2x the buffer size).
+    max_size_bytes = 2 * 1024 * 1024 * 1024
+    min_size_bytes = 256 * 1024 * 1024
+    available_bytes = psutil.virtual_memory().available
+    size_bytes = min(max_size_bytes, available_bytes // 4)
+    if size_bytes < min_size_bytes:
+        raise RuntimeError(
+            f"Insufficient available memory ({available_bytes / 1e9:.1f} GB) "
+            "to profile memory bandwidth"
+        )
     side = math.isqrt(size_bytes // 4)  # Square 2D array of float32
     shape = (side, side)
     actual_bytes = side * side * 4

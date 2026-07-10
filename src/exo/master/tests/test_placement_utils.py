@@ -852,3 +852,72 @@ def test_get_shard_assignments_falls_back_without_bandwidth():
     assert layers_a + layers_b == 12
     assert layers_a == 4
     assert layers_b == 8
+
+
+def test_get_shard_assignments_bandwidth_aware_respects_ram_capacity():
+    """A fast node with little RAM must be capped and the excess redistributed."""
+    # arrange
+    node_a_id = NodeId()
+    node_b_id = NodeId()
+
+    # A is 4x faster but can only hold 3 of the 10 layers (100 bytes each)
+    node_a_mem = create_node_memory(300)
+    node_b_mem = create_node_memory(10_000)
+
+    node_memory = {
+        node_a_id: node_a_mem,
+        node_b_id: node_b_mem,
+    }
+
+    node_bandwidth = {
+        node_a_id: 400_000_000_000,
+        node_b_id: 100_000_000_000,
+    }
+
+    topology = Topology()
+    topology.add_node(node_a_id)
+    topology.add_node(node_b_id)
+
+    topology.add_connection(
+        Connection(source=node_a_id, sink=node_b_id, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b_id, sink=node_a_id, edge=create_socket_connection(2))
+    )
+
+    model_card = ModelCard(
+        model_id=ModelId("test-model"),
+        n_layers=10,
+        storage_size=Memory.from_bytes(1000),  # 100 bytes per layer
+        hidden_size=1000,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+    )
+
+    cycles = topology.get_cycles()
+    selected_cycle = next(cycle for cycle in cycles if len(cycle) == 2)
+
+    # act
+    shard_assignments = get_shard_assignments(
+        model_card, selected_cycle, Sharding.Pipeline, node_memory, node_bandwidth
+    )
+
+    # assert
+    runner_id_a = shard_assignments.node_to_runner[node_a_id]
+    runner_id_b = shard_assignments.node_to_runner[node_b_id]
+
+    layers_a = (
+        shard_assignments.runner_to_shard[runner_id_a].end_layer
+        - shard_assignments.runner_to_shard[runner_id_a].start_layer
+    )
+    layers_b = (
+        shard_assignments.runner_to_shard[runner_id_b].end_layer
+        - shard_assignments.runner_to_shard[runner_id_b].start_layer
+    )
+
+    # Bandwidth alone would give A 8 of 10 layers, but A's RAM fits only 3;
+    # the remainder must flow to B rather than exceeding A's capacity.
+    assert layers_a + layers_b == 10
+    assert layers_a == 3
+    assert layers_b == 7

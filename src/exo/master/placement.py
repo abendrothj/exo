@@ -261,12 +261,8 @@ def place_instance(
     bandwidth_map: dict[NodeId, int] | None = None
     if node_bandwidth:
         bandwidth_map = {
-            node_id: nb.memory_bandwidth
-            for node_id, nb in node_bandwidth.items()
-            if nb.memory_bandwidth is not None
+            node_id: nb.memory_bandwidth for node_id, nb in node_bandwidth.items()
         }
-        if not bandwidth_map:
-            bandwidth_map = None
 
     shard_assignments = get_shard_assignments(
         command.model_card, selected_cycle, command.sharding, node_memory, bandwidth_map

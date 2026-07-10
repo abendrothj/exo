@@ -112,6 +112,9 @@ class ThunderboltBridgeStatus(FrozenModel):
 
 
 class NodeBandwidth(FrozenModel):
-    """Memory bandwidth information for a node."""
+    """Memory bandwidth information for a node.
 
-    memory_bandwidth: int | None = None
+    Only present in state for nodes whose bandwidth was successfully profiled.
+    """
+
+    memory_bandwidth: int

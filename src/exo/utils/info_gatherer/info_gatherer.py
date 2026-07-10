@@ -344,10 +344,10 @@ class NodeMemoryBandwidth(TaggedModel):
     - Unlike memory/disk usage, bandwidth doesn't change at runtime
     """
 
-    memory_bandwidth: int | None = None
+    memory_bandwidth: int
 
     @classmethod
-    async def gather(cls) -> "NodeMemoryBandwidth":
+    async def gather(cls) -> Self | None:
         """Profile memory bandwidth with retries. Returns None if all attempts fail."""
         for attempt in range(1, 6):
             try:
@@ -364,7 +364,7 @@ class NodeMemoryBandwidth(TaggedModel):
                     logger.error(
                         f"Memory bandwidth profiling failed after 5 attempts: {e}"
                     )
-        return cls(memory_bandwidth=None)
+        return None
 
 
 async def _gather_iface_map() -> dict[str, str] | None:
@@ -493,12 +493,17 @@ class InfoGatherer:
             if nc is not None:
                 await self.info_sender.send(nc)
 
+            # Gather memory bandwidth once at startup (macOS only), concurrently
+            # so its retries never delay the rest of the startup gathering
+            if IS_DARWIN:
+                tg.start_soon(self._gather_memory_bandwidth)
+
             await self.info_sender.send(await NodeBackends.gather())
 
-            # Gather memory bandwidth once at startup (macOS only)
-            if IS_DARWIN:
-                bandwidth = await NodeMemoryBandwidth.gather()
-                await self.info_sender.send(bandwidth)
+    async def _gather_memory_bandwidth(self):
+        bandwidth = await NodeMemoryBandwidth.gather()
+        if bandwidth is not None:
+            await self.info_sender.send(bandwidth)
 
     def shutdown(self):
         self._tg.cancel_tasks()
