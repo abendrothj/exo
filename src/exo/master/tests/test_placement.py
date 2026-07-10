@@ -193,6 +193,55 @@ def test_get_instance_placements_create_instance(
     assert shards_sorted[-1].end_layer == total_layers
 
 
+def test_pipeline_placement_uses_manual_per_node_layer_allocation(
+    model_card: ModelCard,
+) -> None:
+    node_a = NodeId()
+    node_b = NodeId()
+    topology = Topology()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(2))
+    )
+    node_memory = {
+        node_a: create_node_memory(300),
+        node_b: create_node_memory(900),
+    }
+    node_network = {
+        node_a: create_node_network(),
+        node_b: create_node_network(),
+    }
+    command = place_instance_command(
+        model_card.model_copy(update={"storage_size": Memory.from_bytes(1000)})
+    ).model_copy(
+        update={
+            "min_nodes": 2,
+            "node_layers": {node_a: 2, node_b: 8},
+        }
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+    )
+
+    instance = next(iter(placements.values()))
+    runner_a = instance.shard_assignments.node_to_runner[node_a]
+    runner_b = instance.shard_assignments.node_to_runner[node_b]
+    shard_a = instance.shard_assignments.runner_to_shard[runner_a]
+    shard_b = instance.shard_assignments.runner_to_shard[runner_b]
+    assert shard_a.end_layer - shard_a.start_layer == 2
+    assert shard_b.end_layer - shard_b.start_layer == 8
+
+
 def test_get_instance_placements_one_node_exact_fit() -> None:
     topology = Topology()
     node_id = NodeId()
