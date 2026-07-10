@@ -457,10 +457,7 @@ class KVPrefixCache:
 
         evicted_any = False
         # Evict LRU entries until below threshold
-        while (
-            len(self.caches) > 0
-            and self.get_memory_used_percentage() > threshold
-        ):
+        while len(self.caches) > 0 and self.get_memory_used_percentage() > threshold:
             lru_index = self._last_used.index(min(self._last_used))
             evicted_tokens = len(self.prompts[lru_index])
             self.prompts.pop(lru_index)
