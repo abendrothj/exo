@@ -3,6 +3,7 @@ import pytest
 from exo.master.placement_utils import (
     allocate_layers_proportionally,
     filter_cycles_by_memory,
+    filter_cycles_by_replicated_memory,
     get_mlx_jaccl_coordinators,
     get_shard_assignments,
     get_shard_assignments_for_pipeline_parallel,
@@ -91,6 +92,29 @@ def test_filter_cycles_by_insufficient_memory():
 
     # assert
     assert len(filtered_cycles) == 0
+
+
+def test_filter_cycles_by_replicated_memory_requires_each_node_to_fit():
+    node1_id = NodeId()
+    node2_id = NodeId()
+    topology = Topology()
+    topology.add_connection(
+        Connection(source=node1_id, sink=node2_id, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node2_id, sink=node1_id, edge=create_socket_connection(2))
+    )
+    cycles = [cycle for cycle in topology.get_cycles() if len(cycle) == 2]
+    node_memory = {
+        node1_id: create_node_memory(8 * 1024),
+        node2_id: create_node_memory(8 * 1024),
+    }
+
+    assert filter_cycles_by_memory(cycles, node_memory, Memory.from_kb(12)) == cycles
+    assert (
+        filter_cycles_by_replicated_memory(cycles, node_memory, Memory.from_kb(12))
+        == []
+    )
 
 
 def test_filter_multiple_cycles_by_memory():

@@ -12,6 +12,7 @@ from exo.shared.types.worker.runners import RunnerId, ShardAssignments
 from exo.shared.types.worker.shards import (
     CfgShardMetadata,
     PipelineShardMetadata,
+    RingShardMetadata,
     Sharding,
     ShardMetadata,
     TensorShardMetadata,
@@ -35,6 +36,23 @@ def filter_cycles_by_memory(
         if total_mem >= required_memory:
             filtered_cycles.append(cycle)
     return filtered_cycles
+
+
+def filter_cycles_by_replicated_memory(
+    cycles: list[Cycle],
+    node_memory: Mapping[NodeId, MemoryUsage],
+    required_memory: Memory,
+) -> list[Cycle]:
+    """Keep cycles where every node can hold a fully replicated model."""
+    return [
+        cycle
+        for cycle in cycles
+        if all(
+            node_id in node_memory
+            and node_memory[node_id].ram_available >= required_memory
+            for node_id in cycle.node_ids
+        )
+    ]
 
 
 def get_smallest_cycles(
@@ -291,6 +309,11 @@ def get_shard_assignments(
                 model_card=model_card,
                 cycle=cycle,
             )
+        case Sharding.Ring:
+            return get_shard_assignments_for_ring_attention(
+                model_card=model_card,
+                cycle=cycle,
+            )
 
 
 def get_mlx_jaccl_devices_matrix(
@@ -459,3 +482,30 @@ def get_mlx_jaccl_coordinators(
         n: f"{get_ip_for_node(n)}:{coordinator_port}"
         for n in cycle_digraph.list_nodes()
     }
+
+
+def get_shard_assignments_for_ring_attention(
+    model_card: ModelCard,
+    cycle: Cycle,
+) -> ShardAssignments:
+    total_layers = model_card.n_layers
+    world_size = len(cycle)
+    runner_to_shard: dict[RunnerId, ShardMetadata] = {}
+    node_to_runner: dict[NodeId, RunnerId] = {}
+    for i, node_id in enumerate(cycle):
+        shard = RingShardMetadata(
+            model_card=model_card,
+            device_rank=i,
+            world_size=world_size,
+            start_layer=0,
+            end_layer=total_layers,
+            n_layers=total_layers,
+        )
+        runner_id = RunnerId()
+        runner_to_shard[runner_id] = shard
+        node_to_runner[node_id] = runner_id
+    return ShardAssignments(
+        model_id=model_card.model_id,
+        runner_to_shard=runner_to_shard,
+        node_to_runner=node_to_runner,
+    )
