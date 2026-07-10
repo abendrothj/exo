@@ -133,7 +133,9 @@ def _validate_manual_layer_allocations(
             "Manual layer allocation must specify exactly the selected pipeline nodes"
         )
     if any(layer_count < 1 for layer_count in node_layers.values()):
-        raise ValueError("Manual layer allocations must assign at least one layer per node")
+        raise ValueError(
+            "Manual layer allocations must assign at least one layer per node"
+        )
     if sum(node_layers.values()) != model_card.n_layers:
         raise ValueError(
             f"Manual layer allocations must sum to {model_card.n_layers} layers"
@@ -143,9 +145,7 @@ def _validate_manual_layer_allocations(
     for index, (node_id, layer_count) in enumerate(
         zip(node_ids, allocations, strict=True)
     ):
-        required_memory = (
-            model_card.storage_size * layer_count
-        ) // model_card.n_layers
+        required_memory = (model_card.storage_size * layer_count) // model_card.n_layers
         available_memory = node_memory[node_id].ram_available
         if required_memory > available_memory:
             raise ValueError(

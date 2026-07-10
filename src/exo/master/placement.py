@@ -122,7 +122,9 @@ def place_instance(
             raise ValueError("Manual layer allocation requires Pipeline sharding")
         requested_nodes = set(command.node_layers)
         candidate_cycles = [
-            cycle for cycle in candidate_cycles if set(cycle.node_ids) == requested_nodes
+            cycle
+            for cycle in candidate_cycles
+            if set(cycle.node_ids) == requested_nodes
         ]
         if not candidate_cycles:
             raise ValueError(
