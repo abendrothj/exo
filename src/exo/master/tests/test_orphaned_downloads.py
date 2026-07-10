@@ -17,9 +17,7 @@ def test_orphaned_download_node_ids_excludes_connected_nodes() -> None:
     state = State(
         topology=topology,
         downloads={
-            retired_node: [
-                DownloadPending(node_id=retired_node, shard_metadata=shard)
-            ],
+            retired_node: [DownloadPending(node_id=retired_node, shard_metadata=shard)],
             connected_node: [
                 DownloadPending(node_id=connected_node, shard_metadata=shard)
             ],
