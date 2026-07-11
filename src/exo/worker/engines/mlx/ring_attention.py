@@ -29,7 +29,6 @@ from typing import Protocol, cast
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
@@ -147,37 +146,12 @@ class RingAttentionLayer(CustomMlxLayer):
         cache, and generation is synchronised by the normal runner protocol,
         so every rank receives the *same* next token.  Gathering K/V here
         would append that token once per rank and corrupt the cache.
+
+        Forwarding to the wrapped attention module keeps decode byte-for-byte
+        identical to the non-ring path, including support for every cache
+        type the model itself supports (BatchKVCache, quantized, rotating).
         """
-        original = cast(_AttentionLayer, self.original_layer)
-        attn = self._get_attn_module(original)
-
-        queries, keys, values, batch_dim, _, n_heads, _ = self._project_qkv(attn, x)
-
-        cache_obj = self._require_kv_cache(cache)
-        rope = getattr(attn, "rope", None)
-        if rope is not None:
-            offset = cache_obj.offset if cache_obj is not None else 0
-            queries = rope(queries, offset=offset)
-            keys = rope(keys, offset=offset)
-
-        if cache_obj is not None:
-            keys, values = cast(
-                tuple[mx.array, mx.array], cache_obj.update_and_fetch(keys, values)
-            )
-
-        scale = self._get_scale(attn)
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(
-            batch_dim, -1, n_heads * queries.shape[-1]
-        )
-
-        o_proj = getattr(attn, "o_proj", None)
-        if o_proj is not None:
-            output = o_proj(output)
-
-        return output
+        return self.original_layer(x, mask=mask, cache=cache)
 
     def _prefill_step(
         self,

@@ -20,7 +20,7 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_map
 from mlx_lm.models import llama, qwen3
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import BatchKVCache, KVCache, QuantizedKVCache
 
 import exo.worker.engines.mlx.generator.generate as generate_module
 from exo.worker.engines.mlx.generator.generate import prefill
@@ -267,6 +267,63 @@ class TestRingPipelineScheduling:
         assert events.index("schedule_receive") < first_compute
         assert first_compute < first_wait
         assert events[-1] == "wait_send"
+
+
+class TestDecodePassthrough:
+    """Decode must forward to the wrapped attention unchanged, so every cache
+    type the model supports (including BatchKVCache) works during batched
+    generation on ring instances."""
+
+    class _TwoRankGroup:
+        def rank(self) -> int:
+            return 0
+
+        def size(self) -> int:
+            return 2
+
+    @staticmethod
+    def _tiny_llama_attention() -> nn.Module:
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+        return llama.Model(args).model.layers[0].self_attn
+
+    def test_decode_with_batch_kv_cache_matches_unwrapped(self) -> None:
+        attention = self._tiny_llama_attention()
+        wrapped = RingAttentionLayer(attention, self._TwoRankGroup())
+
+        wrapped_cache = BatchKVCache(left_padding=[1, 0])
+        unwrapped_cache = BatchKVCache(left_padding=[1, 0])
+
+        for step in range(3):
+            x = mx.arange(2 * 16, dtype=mx.float32).reshape(2, 1, 16) / (16 + step)
+            wrapped_out = wrapped(x, mask=None, cache=wrapped_cache)
+            unwrapped_out = attention(x, mask=None, cache=unwrapped_cache)
+            mx.eval(wrapped_out, unwrapped_out)
+            assert wrapped_out.shape == (2, 1, 16)
+            assert mx.array_equal(wrapped_out, unwrapped_out).item()
+
+    def test_decode_with_standard_kv_cache_matches_unwrapped(self) -> None:
+        attention = self._tiny_llama_attention()
+        wrapped = RingAttentionLayer(attention, self._TwoRankGroup())
+
+        wrapped_cache = KVCache()
+        unwrapped_cache = KVCache()
+
+        for step in range(3):
+            x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 16) / (16 + step)
+            wrapped_out = wrapped(x, mask=None, cache=wrapped_cache)
+            unwrapped_out = attention(x, mask=None, cache=unwrapped_cache)
+            mx.eval(wrapped_out, unwrapped_out)
+            assert mx.array_equal(wrapped_out, unwrapped_out).item()
 
 
 class TestSetRingPrefill:
