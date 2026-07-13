@@ -192,6 +192,14 @@ class RingAttentionLayer(CustomMlxLayer):
             queries = rope(queries, offset=local_offset)
             keys = rope(keys, offset=local_offset)
 
+        # Communication ops must never depend on unfinished GPU work when they
+        # are posted: with MLX_METAL_FAST_SYNCH the CPU send would then block
+        # on a Metal shared event inside a bounded command-buffer queue, which
+        # can form a cross-rank circular wait (observed as an intermittent
+        # long-sequence prefill hang). Materialising the KV payload here keeps
+        # the send and receive streams pure-CPU so transport always drains.
+        mx.eval(keys, values)
+
         all_keys: dict[int, mx.array] = {self.rank: keys}
         all_values: dict[int, mx.array] = {self.rank: values}
 
@@ -240,10 +248,14 @@ class RingAttentionLayer(CustomMlxLayer):
                 )
                 pending_sends.extend((sent_keys, sent_values))
 
+                # Templates are allocated on the CPU receive stream so the
+                # posted receive never waits on a GPU kernel (see the payload
+                # materialisation note above).
                 recv_keys = mx.distributed.recv_like(
                     mx.zeros(
                         (batch_dim, n_kv_heads, block_lengths[next_rank], head_dim),
                         dtype=current_keys.dtype,
+                        stream=self.receive_stream,
                     ),
                     source_peer_rank,
                     group=self.group,
@@ -253,6 +265,7 @@ class RingAttentionLayer(CustomMlxLayer):
                     mx.zeros(
                         (batch_dim, n_kv_heads, block_lengths[next_rank], head_dim),
                         dtype=current_values.dtype,
+                        stream=self.receive_stream,
                     ),
                     source_peer_rank,
                     group=self.group,

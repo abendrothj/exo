@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import math
+import os
 import time
 import uuid
 from typing import Callable, Generator, cast, get_args
@@ -31,6 +32,7 @@ from exo.shared.types.text_generation import (
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
 )
+from exo.utils.stall_watchdog import StallWatchdog
 from exo.worker.engines.mlx.auto_parallel import (
     PipelineFirstLayer,
     PipelineLastLayer,
@@ -353,18 +355,25 @@ def prefill(
             if len(chunk_ranges) > 1 and num_tokens - chunk_ranges[-1] < world_size:
                 chunk_ranges.pop()
 
+            stall_timeout_seconds = float(
+                os.environ.get("EXO_PREFILL_STALL_TIMEOUT", "300")
+            )
             combined_progress_callback(0, num_tokens)
-            for chunk_start in chunk_ranges:
-                chunk_end = min(chunk_start + max_chunk_size, num_tokens)
-                if chunk_start == chunk_ranges[-1]:
-                    chunk_end = num_tokens
-                chunk_size = chunk_end - chunk_start
-                start = chunk_start + (chunk_size * rank) // world_size
-                end = chunk_start + (chunk_size * (rank + 1)) // world_size
-                with mx.stream(generation_stream):
-                    model(prompt_tokens[start:end][None], cache=cache)
-                    mx.eval([c.state for c in cache])  # type: ignore
-                combined_progress_callback(chunk_end, num_tokens)
+            with StallWatchdog(
+                stall_timeout_seconds, f"Ring prefill ({num_tokens} tokens)"
+            ) as stall_watchdog:
+                for chunk_start in chunk_ranges:
+                    chunk_end = min(chunk_start + max_chunk_size, num_tokens)
+                    if chunk_start == chunk_ranges[-1]:
+                        chunk_end = num_tokens
+                    chunk_size = chunk_end - chunk_start
+                    start = chunk_start + (chunk_size * rank) // world_size
+                    end = chunk_start + (chunk_size * (rank + 1)) // world_size
+                    with mx.stream(generation_stream):
+                        model(prompt_tokens[start:end][None], cache=cache)
+                        mx.eval([c.state for c in cache])  # type: ignore
+                    stall_watchdog.kick()
+                    combined_progress_callback(chunk_end, num_tokens)
         elif is_pipeline and num_tokens >= prefill_step_size:
             set_pipeline_queue_sends(model, queue_sends=True)
             assert group is not None, "Pipeline prefill requires a distributed group"
