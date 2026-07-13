@@ -1,7 +1,7 @@
 import shutil
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, cast
 
 import psutil
 
@@ -15,6 +15,21 @@ class MemoryUsage(FrozenModel):
     ram_available: Memory
     swap_total: Memory
     swap_available: Memory
+    # Dedicated accelerator memory (e.g. CUDA VRAM). None on unified-memory
+    # platforms, where system RAM is the accelerator memory.
+    accelerator_total: Memory | None = None
+    accelerator_available: Memory | None = None
+
+    @property
+    def inference_available(self) -> Memory:
+        """Memory actually available to hold model state on this node.
+
+        On discrete-GPU nodes the accelerator's free memory bounds what
+        inference can use, regardless of how much system RAM is free.
+        """
+        if self.accelerator_available is None:
+            return self.ram_available
+        return min(self.ram_available, self.accelerator_available)
 
     @classmethod
     def from_bytes(
@@ -31,13 +46,42 @@ class MemoryUsage(FrozenModel):
     def from_psutil(cls, *, override_memory: int | None) -> Self:
         vm = psutil.virtual_memory()
         sm = psutil.swap_memory()
+        accelerator = _accelerator_memory()
 
-        return cls.from_bytes(
-            ram_total=vm.total,
-            ram_available=vm.available if override_memory is None else override_memory,
-            swap_total=sm.total,
-            swap_available=sm.free,
+        return cls(
+            ram_total=Memory.from_bytes(vm.total),
+            ram_available=Memory.from_bytes(
+                vm.available if override_memory is None else override_memory
+            ),
+            swap_total=Memory.from_bytes(sm.total),
+            swap_available=Memory.from_bytes(sm.free),
+            accelerator_total=accelerator[0],
+            accelerator_available=accelerator[1],
         )
+
+
+def _accelerator_memory() -> tuple[Memory | None, Memory | None]:
+    """Report dedicated accelerator memory where one exists (CUDA VRAM).
+
+    Returns (None, None) on unified-memory platforms or when no NVML-visible
+    device is present.
+    """
+    try:
+        import pynvml
+    except ImportError:
+        return None, None
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            total_bytes = cast(int, info.total)
+            free_bytes = cast(int, info.free)
+            return Memory.from_bytes(total_bytes), Memory.from_bytes(free_bytes)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return None, None
 
 
 class DiskUsage(FrozenModel):

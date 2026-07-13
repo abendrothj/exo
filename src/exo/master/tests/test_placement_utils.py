@@ -2,6 +2,7 @@ import pytest
 
 from exo.master.placement_utils import (
     allocate_layers_proportionally,
+    estimate_ring_node_memory,
     filter_cycles_by_memory,
     filter_cycles_by_replicated_memory,
     get_mlx_jaccl_coordinators,
@@ -19,6 +20,7 @@ from exo.shared.types.backends import Backend
 from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
+    MemoryUsage,
     NetworkInterfaceInfo,
     NodeNetworkInfo,
 )
@@ -713,3 +715,107 @@ class TestCfgParallelPlacement:
         # First shard starts at 0, last shard ends at 57
         assert layer_ranges[0][0] == 0
         assert layer_ranges[-1][1] == 57
+
+
+class TestRingMemoryAdmission:
+    @staticmethod
+    def _ring_card(
+        *,
+        context_length: int = 131072,
+        num_key_value_heads: int | None = 8,
+    ) -> ModelCard:
+        return ModelCard(
+            model_id=ModelId("ring-test"),
+            n_layers=16,
+            storage_size=Memory.from_mb(700),
+            hidden_size=2048,
+            supports_tensor=True,
+            supports_ring=True,
+            num_key_value_heads=num_key_value_heads,
+            context_length=context_length,
+            tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal, Backend.MlxCuda],
+        )
+
+    def test_estimate_exceeds_weights_alone(self) -> None:
+        card = self._ring_card()
+        estimate = estimate_ring_node_memory(card)
+        assert estimate > card.storage_size
+        # 16 layers x 8 kv heads x 128 head dim x 16384 tokens x 2 (K+V)
+        # x 2 bytes x 4 working-set multiplier = 4 GiB of working set.
+        assert estimate - card.storage_size == Memory.from_bytes(
+            2 * 2 * 16 * 8 * 128 * 16384 * 4
+        )
+
+    def test_admission_context_is_capped(self) -> None:
+        huge_context = self._ring_card(context_length=1_000_000)
+        capped = self._ring_card(context_length=16384)
+        assert estimate_ring_node_memory(huge_context) == estimate_ring_node_memory(
+            capped
+        )
+
+    def test_hidden_size_fallback_without_kv_heads(self) -> None:
+        card = self._ring_card(num_key_value_heads=None)
+        estimate = estimate_ring_node_memory(card)
+        assert estimate - card.storage_size == Memory.from_bytes(
+            2 * 2 * 16 * 2048 * 16384 * 4
+        )
+
+
+class TestAcceleratorMemoryAdmission:
+    def test_inference_available_bounded_by_accelerator(self) -> None:
+        usage = MemoryUsage(
+            ram_total=Memory.from_gb(8),
+            ram_available=Memory.from_gb(7),
+            swap_total=Memory(),
+            swap_available=Memory(),
+            accelerator_total=Memory.from_gb(4),
+            accelerator_available=Memory.from_gb(4),
+        )
+        assert usage.inference_available == Memory.from_gb(4)
+
+    def test_inference_available_defaults_to_ram(self) -> None:
+        usage = MemoryUsage(
+            ram_total=Memory.from_gb(8),
+            ram_available=Memory.from_gb(7),
+            swap_total=Memory(),
+            swap_available=Memory(),
+        )
+        assert usage.inference_available == Memory.from_gb(7)
+
+    def test_replicated_filter_rejects_small_vram_node(self) -> None:
+        node1_id = NodeId()
+        node2_id = NodeId()
+        connection = Connection(
+            source=node1_id, sink=node2_id, edge=create_socket_connection(1)
+        )
+        reverse = Connection(
+            source=node2_id, sink=node1_id, edge=create_socket_connection(2)
+        )
+        topology = Topology()
+        topology.add_connection(connection)
+        topology.add_connection(reverse)
+        cycles = topology.get_cycles()
+        big_ram_small_vram = MemoryUsage(
+            ram_total=Memory.from_gb(8),
+            ram_available=Memory.from_gb(7),
+            swap_total=Memory(),
+            swap_available=Memory(),
+            accelerator_total=Memory.from_gb(4),
+            accelerator_available=Memory.from_gb(4),
+        )
+        plenty = MemoryUsage(
+            ram_total=Memory.from_gb(24),
+            ram_available=Memory.from_gb(20),
+            swap_total=Memory(),
+            swap_available=Memory(),
+        )
+        node_memory = {node1_id: plenty, node2_id: big_ram_small_vram}
+
+        required = Memory.from_gb(5)
+        surviving = filter_cycles_by_replicated_memory(cycles, node_memory, required)
+        assert all(node2_id not in cycle.node_ids for cycle in surviving)
+        both_plenty = filter_cycles_by_replicated_memory(
+            cycles, {node1_id: plenty, node2_id: plenty}, required
+        )
+        assert any(node2_id in cycle.node_ids for cycle in both_plenty)

@@ -30,7 +30,7 @@ def filter_cycles_by_memory(
             continue
 
         total_mem = sum(
-            (node_memory[node_id].ram_available for node_id in cycle.node_ids),
+            (node_memory[node_id].inference_available for node_id in cycle.node_ids),
             start=Memory(),
         )
         if total_mem >= required_memory:
@@ -49,10 +49,52 @@ def filter_cycles_by_replicated_memory(
         for cycle in cycles
         if all(
             node_id in node_memory
-            and node_memory[node_id].ram_available >= required_memory
+            and node_memory[node_id].inference_available >= required_memory
             for node_id in cycle.node_ids
         )
     ]
+
+
+# K and V cache entries are stored unquantized at 2 bytes each during Ring
+# prefill; the working-set multiplier covers transient attention buffers and
+# allocator caching observed in practice (Metal peaked at ~3x the steady KV
+# size, CUDA at ~5x, for the same prefill).
+_KV_CACHE_BYTES_PER_ELEMENT = 2
+_RING_KV_WORKING_SET_MULTIPLIER = 4
+# Upper bound on head_dim across the verified Ring model families (Llama,
+# Qwen3), used when the card does not pin the exact geometry.
+_RING_HEAD_DIM_BOUND = 128
+# Ring exists for long-context prefill; admit against at least this context
+# even if requests may be shorter, and no more than this even for cards that
+# advertise 128K+ so admission stays achievable.
+_RING_ADMISSION_CONTEXT_TOKENS = 16384
+
+
+def estimate_ring_node_memory(model_card: ModelCard) -> Memory:
+    """Per-node memory a Ring rank needs: replicated weights plus the working
+    set of a long-context prefill (full KV cache and attention transients).
+
+    Weight-only admission demonstrably over-admits: a 4 GB-VRAM rank passed
+    the old check for a model whose 16K prefill peaks well past 4 GB.
+    """
+    admission_context = (
+        min(model_card.context_length, _RING_ADMISSION_CONTEXT_TOKENS)
+        if model_card.context_length > 0
+        else _RING_ADMISSION_CONTEXT_TOKENS
+    )
+    if model_card.num_key_value_heads is not None:
+        kv_width = model_card.num_key_value_heads * _RING_HEAD_DIM_BOUND
+    else:
+        kv_width = model_card.hidden_size
+    kv_cache_bytes = (
+        2  # keys and values
+        * _KV_CACHE_BYTES_PER_ELEMENT
+        * model_card.n_layers
+        * kv_width
+        * admission_context
+    )
+    working_set = Memory.from_bytes(kv_cache_bytes * _RING_KV_WORKING_SET_MULTIPLIER)
+    return model_card.storage_size + working_set
 
 
 def get_smallest_cycles(
@@ -103,7 +145,7 @@ def _compute_total_memory(
     node_memory: Mapping[NodeId, MemoryUsage],
 ) -> Memory:
     total_memory = sum(
-        (node_memory[node_id].ram_available for node_id in node_ids),
+        (node_memory[node_id].inference_available for node_id in node_ids),
         start=Memory(),
     )
     if total_memory.in_bytes == 0:
@@ -120,7 +162,8 @@ def _allocate_and_validate_layers(
     layer_allocations = allocate_layers_proportionally(
         total_layers=model_card.n_layers,
         memory_fractions=[
-            node_memory[node_id].ram_available / total_memory for node_id in node_ids
+            node_memory[node_id].inference_available / total_memory
+            for node_id in node_ids
         ],
     )
 
@@ -129,7 +172,7 @@ def _allocate_and_validate_layers(
     for i, node_id in enumerate(node_ids):
         node_layers = layer_allocations[i]
         required_memory = (total_storage * node_layers) // total_layers
-        available_memory = node_memory[node_id].ram_available
+        available_memory = node_memory[node_id].inference_available
         if required_memory > available_memory:
             raise ValueError(
                 f"Node {i} ({node_id}) has insufficient memory: "

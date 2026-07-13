@@ -4,6 +4,7 @@ from typing import Sequence
 
 from exo.master.placement_utils import (
     Cycle,
+    estimate_ring_node_memory,
     filter_cycles_by_memory,
     filter_cycles_by_replicated_memory,
     get_mlx_jaccl_coordinators,
@@ -137,14 +138,18 @@ def place_instance(
             for cycle in candidate_cycles
             if required_nodes.issubset(cycle.node_ids)
         ]
-    memory_filter = (
-        filter_cycles_by_replicated_memory
-        if command.sharding is Sharding.Ring
-        else filter_cycles_by_memory
-    )
-    cycles_with_sufficient_memory = memory_filter(
-        candidate_cycles, node_memory, command.model_card.storage_size
-    )
+    if command.sharding is Sharding.Ring:
+        # Every ring rank replicates the weights and must also hold the
+        # long-context prefill working set, not just the model file.
+        cycles_with_sufficient_memory = filter_cycles_by_replicated_memory(
+            candidate_cycles,
+            node_memory,
+            estimate_ring_node_memory(command.model_card),
+        )
+    else:
+        cycles_with_sufficient_memory = filter_cycles_by_memory(
+            candidate_cycles, node_memory, command.model_card.storage_size
+        )
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")
 
