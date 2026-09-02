@@ -352,6 +352,14 @@ def find_ip_prioritised(
     connections = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     if not connections:
         return None
+    # Deduplicate in first-seen order: `min` breaks ties on iteration order, and
+    # unmeasured links all tie at infinity, so a set here would make the choice
+    # vary with hash seed between master restarts.
+    candidate_ips = list(
+        dict.fromkeys(
+            connection.sink_multiaddr.ip_address for connection in connections
+        )
+    )
     latency_by_ip: dict[str, float] = {}
     for connection in connections:
         ip_address = connection.sink_multiaddr.ip_address
@@ -377,7 +385,7 @@ def find_ip_prioritised(
             "unknown": 4,
         }
         return min(
-            {connection.sink_multiaddr.ip_address for connection in connections},
+            candidate_ips,
             key=lambda ip: (
                 latency_by_ip.get(ip, float("inf")),
                 priority.get(ip_to_type.get(ip, "unknown"), 2),
@@ -393,7 +401,7 @@ def find_ip_prioritised(
         "thunderbolt": 4,
     }
     return min(
-        {connection.sink_multiaddr.ip_address for connection in connections},
+        candidate_ips,
         key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), 2),
     )
 
